@@ -208,7 +208,7 @@ def get_advice_english(problem: str, batch_size: int = 64) -> str:
 
     # Pre-filter: only score entries containing at least one keyword
     # from the problem — reduces 22k entries to ~300 for speed
-    keywords = [w.lower() for w in problem.split() if len(w) > 3]
+    keywords = [w.lower() for w in problem.split() if len(w) > 4]  # simple heuristic: use words >4 chars as keywords
     if keywords:
         filtered_kb = [
             entry for entry in kb
@@ -220,8 +220,8 @@ def get_advice_english(problem: str, batch_size: int = 64) -> str:
     else:
         filtered_kb = kb[:200]
 
-    # Hard cap at 300 entries max for speed
-    filtered_kb = filtered_kb[:300]
+    # Hard cap at 600 entries max for speed
+    filtered_kb = filtered_kb[:600]
 
     for i in range(0, len(filtered_kb), batch_size):
         batch = filtered_kb[i : i + batch_size]
