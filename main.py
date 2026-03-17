@@ -38,7 +38,7 @@ app = FastAPI(title="KisanVaani Agricultural Advisor API", version="1.0.0")
 # CORS — allow your Next.js frontend (update origins for production)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://localhost:8080", "http://localhost:5173", "https://your-frontend.vercel.app"],
+    allow_origins=["http://localhost:3000", "http://localhost:8080", "http://localhost:5173", "https://mrcahrles00-agriwise-backend.hf.space", "https://your-frontend.vercel.app"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
