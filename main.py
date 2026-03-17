@@ -47,7 +47,7 @@ app.add_middleware(
 # ── Config ────────────────────────────────────────────────────────────────────
 # Local path during development. For Render, model is downloaded from HF.
 HF_REPO        = os.getenv("HF_REPO", "your-hf-username/kisan-vaani-agricultural-advisor")
-MODEL_PATH     = os.getenv("MODEL_PATH", "./kisan_vaani_model")   # local fallback
+MODEL_PATH = os.getenv("MODEL_PATH", "/app/model_cache")   # local fallback
 DEVICE         = "cuda" if torch.cuda.is_available() else "cpu"
 
 # ── Supported languages ───────────────────────────────────────────────────────
@@ -220,8 +220,8 @@ def get_advice_english(problem: str, batch_size: int = 64) -> str:
     else:
         filtered_kb = kb[:200]
 
-    # Hard cap at 600 entries max for speed
-    filtered_kb = filtered_kb[:600]
+    # Hard cap at 300 entries max for speed
+    filtered_kb = filtered_kb[:00]
 
     for i in range(0, len(filtered_kb), batch_size):
         batch = filtered_kb[i : i + batch_size]
