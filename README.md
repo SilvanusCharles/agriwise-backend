@@ -1,3 +1,12 @@
+---
+title: Agriwise Backend
+emoji: 🌱
+colorFrom: green
+colorTo: yellow
+sdk: docker
+pinned: false
+---
+
 # KisanVaani Agricultural Advisor — Backend API
 
 A FastAPI backend that serves agricultural advice in 5 Nigerian languages using a fine-tuned mBERT model. Built to be consumed by the KisanVaani Next.js frontend.
@@ -226,7 +235,7 @@ import { LANGUAGES } from "@/hooks/useAgriAdvice"
 2. On [render.com](https://render.com) create a **Web Service** linked to the repo
 3. Set environment variables in the Render dashboard:
    ```
-   HF_REPO=your-hf-username/kisan-vaani-agricultural-advisor
+   HF_REPO = os.getenv("HF_REPO", "MrCahrles00/agriadvisor-model")
    ```
 4. Set build and start commands:
    - **Build command:** `pip install -r requirements.txt`
