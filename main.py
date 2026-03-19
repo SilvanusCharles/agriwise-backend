@@ -176,53 +176,6 @@ def load_knowledge_base():
             "Rotate crops annually to prevent soil nutrient depletion.",
         ]
 
-def get_advice_english(problem: str, batch_size: int = 64) -> str:
-    """Score problem against KB, return highest-scoring answer."""
-    tokenizer, model = load_model()
-    kb               = load_knowledge_base()
-    all_scores       = []
-
-    # Pre-filter: only score entries containing at least one keyword
-    # from the problem — reduces 22k entries to ~300 for speed
-    keywords = [w.lower() for w in problem.split() if len(w) > 4]  # simple heuristic: use words >4 chars as keywords
-    if keywords:
-        filtered_kb = [
-            entry for entry in kb
-            if any(kw in entry.lower() for kw in keywords)
-        ]
-        # Always keep at least 200 entries even if no keyword matches
-        if len(filtered_kb) < 200:
-            filtered_kb = kb[:200]
-    else:
-        filtered_kb = kb[:200]
-
-    # Hard cap at 800 entries max for speed
-    filtered_kb = filtered_kb[:800]
-
-    for i in range(0, len(filtered_kb), batch_size):
-        batch = filtered_kb[i : i + batch_size]
-        enc   = tokenizer(
-            [problem] * len(batch),
-            batch,
-            max_length     = 256,
-            padding        = "max_length",
-            truncation     = True,
-            return_tensors = "pt",
-        ).to(DEVICE)
-        with torch.no_grad():
-            logits = model(**enc).logits
-        scores = torch.softmax(logits, dim=1)[:, 1].cpu().numpy()
-        all_scores.extend(scores.tolist())
-
-    best_idx = int(np.argmax(all_scores))
-    confidence = float(all_scores[best_idx])
-    
-    # NEW: If the model is completely guessing (low confidence), 
-    # force a helpful fallback instead of returning irrelevant data
-    if confidence < 0.4: 
-        return "Please provide more details about the crop, the symptoms you are seeing, and your current soil conditions so I can give you accurate advice.", confidence
-        
-    return filtered_kb[best_idx], confidence
 
 # ── Translation helpers ────────────────────────────────────────────────────────
 def pidgin_to_english(text: str) -> str:
@@ -281,7 +234,7 @@ def text_to_speech_base64(text: str, lang: str) -> str:
         return ""
 
 # ── Core advice retrieval ─────────────────────────────────────────────────────
-def get_advice_english(problem: str, batch_size: int = 64) -> str:
+def get_advice_english(problem: str, batch_size: int = 64):
     """Score problem against KB, return highest-scoring answer."""
     tokenizer, model = load_model()
     kb               = load_knowledge_base()
@@ -320,7 +273,13 @@ def get_advice_english(problem: str, batch_size: int = 64) -> str:
         all_scores.extend(scores.tolist())
 
     best_idx = int(np.argmax(all_scores))
-    return filtered_kb[best_idx], float(all_scores[best_idx])
+    confidence = float(all_scores[best_idx])
+
+    # NEW: Safety check to stop random guessing
+    # If confidence is too low, return a helpful fallback instead
+    if confidence < 0.4: 
+        return "I couldn't find an exact match for that. Please provide more details about the crop, symptoms, or soil conditions so I can give you accurate advice.", confidence
+    return filtered_kb[best_idx], confidence
 # ── Request / Response models ─────────────────────────────────────────────────
 class AdviceRequest(BaseModel):
     problem : str
