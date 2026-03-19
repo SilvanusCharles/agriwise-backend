@@ -42,7 +42,7 @@ app.add_middleware(
                    "http://localhost:8080",
                     "http://localhost:5173",
                    "https://mrcahrles00-agriwise-backend.hf.space",
-                     "https://your-frontend.vercel.app
+                    #  "https://your-frontend.vercel.app
             ],
     allow_credentials=True,
     allow_methods=["*"],
@@ -211,21 +211,22 @@ def get_advice_english(problem: str, batch_size: int = 64) -> str:
     kb               = load_knowledge_base()
     all_scores       = []
 
-    # Pre-filter: use words longer than 4 chars for better matching
-    keywords = [w.lower() for w in problem.split() if len(w) > 4]
-    
+    # Pre-filter: only score entries containing at least one keyword
+    # from the problem — reduces 22k entries to ~300 for speed
+    keywords = [w.lower() for w in problem.split() if len(w) > 4]  # simple heuristic: use words >4 chars as keywords
     if keywords:
         filtered_kb = [
             entry for entry in kb
             if any(kw in entry.lower() for kw in keywords)
         ]
+        # Always keep at least 200 entries even if no keyword matches
         if len(filtered_kb) < 200:
             filtered_kb = kb[:200]
     else:
         filtered_kb = kb[:200]
 
-    # Cap at 500 for speed while maintaining quality
-    filtered_kb = filtered_kb[:500]
+    # Hard cap at 300 entries max for speed
+    filtered_kb = filtered_kb[:600]
 
     for i in range(0, len(filtered_kb), batch_size):
         batch = filtered_kb[i : i + batch_size]
