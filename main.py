@@ -225,8 +225,8 @@ def get_advice_english(problem: str, batch_size: int = 64) -> str:
     else:
         filtered_kb = kb[:200]
 
-    # Hard cap at 300 entries max for speed
-    filtered_kb = filtered_kb[:600]
+    # Hard cap at 800 entries max for speed
+    filtered_kb = filtered_kb[:800]
 
     for i in range(0, len(filtered_kb), batch_size):
         batch = filtered_kb[i : i + batch_size]
