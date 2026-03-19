@@ -278,7 +278,7 @@ def get_advice_english(problem: str, batch_size: int = 64):
     # NEW: Safety check to stop random guessing
     # If confidence is too low, return a helpful fallback instead
     if confidence < 0.4: 
-        return "I couldn't find an exact match for that. Please provide more details about the crop, symptoms, or soil conditions so I can give you accurate advice.", confidence
+        return "I couldn't find an exact match for your query. Please provide more details about the crop, symptoms, or soil conditions so I can give you accurate advice.", confidence
     return filtered_kb[best_idx], confidence
 # ── Request / Response models ─────────────────────────────────────────────────
 class AdviceRequest(BaseModel):
