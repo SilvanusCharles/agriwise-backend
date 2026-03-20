@@ -32,6 +32,34 @@ from deep_translator import GoogleTranslator
 from gtts import gTTS
 import whisper
 
+
+from langdetect import detect, DetectorFactory
+from deep_translator import GoogleTranslator
+from langdetect import detect
+# Ensures detection is consistent
+DetectorFactory.seed = 0
+
+def smart_translate_to_english(text, user_hint):
+    """Detects the language and translates it to English."""
+    try:
+        # 1. Quick check for Pidgin
+        pidgin_indicators = ["dey", "don", "abeg", "wetin", "sabi", "naim", "no be"]
+        if any(word in text.lower() for word in pidgin_indicators):
+            detected_lang = "pcm"
+        else:
+            # 2. Use langdetect for ha, yo, ig, en
+            detected_lang = detect(text)
+        
+        # If the user explicitly picked a language other than English, trust them
+        final_lang = user_hint if user_hint != "en" else detected_lang
+        
+        # 3. Translate to English for the model
+        translation = GoogleTranslator(source='auto', target='en').translate(text)
+        return translation, final_lang
+    except Exception as e:
+        print(f"Detection/Translation error: {e}")
+        return text, "en"
+
 # ── Global Configurations ─────────────────────────────────────────────────────
 # This forces PyTorch to use the CPU since we are on the HF free tier
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -149,11 +177,11 @@ def load_knowledge_base():
     """
     kb_path = Path(MODEL_PATH) / "answers_list.npy"
     if kb_path.exists():
-        answers = np.load(str(kb_path), allow_pickle=True).tolist()
-        # NEW: Filter out garbage answers (anything less than 5 words)
-        valid_answers = [str(a) for a in answers if len(str(a).split()) >= 5]
-        print(f"Cleaned Knowledge base loaded: {len(valid_answers)} entries.")
-        return valid_answers
+       answers = np.load(str(kb_path), allow_pickle=True).tolist()
+       print(f"Knowledge base loaded: {len(answers)} entries.")
+        # FIX: The current code returns a generator. Add list(...) to materialize it.
+        # This relates back to the clean-up we talked about to stop 1-word answers.
+       return list(str(a) for a in answers)
 
     # Fallback: load directly from HF dataset (requires datasets library)
     try:
