@@ -103,6 +103,8 @@ MODEL_PATH          = os.getenv("MODEL_PATH", "/app/kisan_vaani_model")   # loca
 DEVICE              = "cuda" if torch.cuda.is_available() else "cpu"
 EMBEDDING_MODEL     = os.getenv("EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
 HF_INFERENCE_TOKEN  = os.getenv("HF_INFERENCE_TOKEN", None)
+USE_HF_FALLBACK     = os.getenv("USE_HF_FALLBACK", "true").lower() in ["1", "true", "yes"]
+FALLBACK_THRESHOLD  = float(os.getenv("FALLBACK_THRESHOLD", "0.4"))
 FAISS_INDEX_PATH    = Path(MODEL_PATH) / "faiss.index"
 
 # ── Supported languages ───────────────────────────────────────────────────────
@@ -315,20 +317,51 @@ def text_to_speech_base64(text: str, lang: str) -> str:
         print(f"Failed to generate TTS: {e}")
         return ""
 
-# ── Core advice retrieval ─────────────────────────────────────────────────────
-def hf_model_fallback(problem: str) -> str:
-    if not HF_INFERENCE_TOKEN:
+
+def sanitize_advice_text(answer: str) -> str:
+    """Drop unsafe/irrelevant answers and keep only domain-relevant ones."""
+    if not answer or len(answer.strip()) < 15:
         return ""
+
+    low_quality_tokens = ["lifetime", "calculation", "numbers", "not simple"]
+    lowered = answer.lower()
+    if any(tok in lowered for tok in low_quality_tokens):
+        return ""
+
+    wordcount = len(answer.strip().split())
+    if wordcount < 5:
+        return ""
+
+    return answer.strip()
+
+# ── Core advice retrieval ─────────────────────────────────────────────────────
+def hf_model_fallback(problem: str, lang: str = "en") -> str:
+    if not HF_INFERENCE_TOKEN or not USE_HF_FALLBACK:
+        return ""
+
+    # Ensure we respond in requested language to avoid English-only surprises.
+    target_name = SUPPORTED_LANGUAGES.get(lang, "English")
+    prompt = (
+        "You are an experienced agricultural advisor for smallholder farmers. "
+        f"Answer the question below in {target_name}. Keep advice concise and practical.\n\n"
+        f"Question: {problem}\n"
+        f"Language: {lang}\n"
+        "Answer:"
+    )
 
     url = f"https://api-inference.huggingface.co/models/{HF_REPO}"
     headers = {
         "Authorization": f"Bearer {HF_INFERENCE_TOKEN}",
         "Content-Type": "application/json",
     }
-    prompt = f"You are an agriculture expert. Provide concise farming advice for: {problem}"
 
     try:
-        response = requests.post(url, headers=headers, json={"inputs": prompt, "options": {"wait_for_model": True}}, timeout=25)
+        response = requests.post(
+            url,
+            headers=headers,
+            json={"inputs": prompt, "options": {"wait_for_model": True}, "parameters": {"max_new_tokens": 130, "temperature": 0.7}},
+            timeout=30,
+        )
         response.raise_for_status()
         data = response.json()
 
@@ -336,11 +369,15 @@ def hf_model_fallback(problem: str) -> str:
             print(f"HF fallback returned error: {data['error']}")
             return ""
 
-        if isinstance(data, list) and len(data) > 0 and isinstance(data[0], dict) and "generated_text" in data[0]:
-            return data[0]["generated_text"]
+        if isinstance(data, list) and len(data) > 0:
+            first = data[0]
+            if isinstance(first, dict) and "generated_text" in first:
+                return first["generated_text"].strip()
+            if isinstance(first, str):
+                return first.strip()
 
         if isinstance(data, str):
-            return data
+            return data.strip()
 
         return ""
     except Exception as e:
@@ -348,7 +385,7 @@ def hf_model_fallback(problem: str) -> str:
         return ""
 
 
-def get_advice_english(problem: str, batch_size: int = 64):
+def get_advice_english(problem: str, lang: str = "en", batch_size: int = 64):
     start_time = time.time()
     tokenizer, model = load_model()
     vector_index, kb = build_vector_index()
@@ -405,18 +442,20 @@ def get_advice_english(problem: str, batch_size: int = 64):
     confidence = float(all_scores[best_idx])
     best_answer = candidates[best_idx]
 
-    if confidence < 0.4:
-        hf_text = hf_model_fallback(problem)
+    if confidence < FALLBACK_THRESHOLD:
+        hf_text = hf_model_fallback(problem, lang=lang)
+        hf_text = sanitize_advice_text(hf_text)
         if hf_text:
-            print(f"Low confidence fallback from HF model: {confidence:.2f}")
+            print(f"Low confidence local answer ({confidence:.2f}) -> HF fallback used.")
             return hf_text, confidence
 
         fallback_text = "I couldn't find a high-confidence answer. Please add crop type, symptoms, and location condition for a better response."
-        print(f"Low confidence: {confidence:.2f}, return fallback.")
+        print(f"Low confidence: {confidence:.2f}, return generic fallback.")
         return fallback_text, confidence
 
     elapsed = time.time() - start_time
     print(f"get_advice_english succeeded in {elapsed:.3f}s, confidence {confidence:.3f}")
+    best_answer = sanitize_advice_text(best_answer) or "I am sorry, I could not process your request right now. Please try again with more details."
     return best_answer, confidence
 # ── Request / Response models ─────────────────────────────────────────────────
 class AdviceRequest(BaseModel):
@@ -461,8 +500,13 @@ def get_advice(req: AdviceRequest):
         )
 
     english_input = translate_to_english(req.problem, lang)
-    english_advice, confidence = get_advice_english(english_input)
+    english_advice, confidence = get_advice_english(english_input, lang=lang)
     translated_advice = translate_from_english(english_advice, lang)
+    if lang != "en" and (not translated_advice.strip() or translated_advice.strip() == english_advice.strip()):
+        translated_advice = f"{english_advice}"
+
+    if lang != "en":
+        translated_advice = f"{translated_advice}\n\n(English version: {english_advice})"
 
     audio_b64 = None
     if req.tts:
@@ -523,8 +567,13 @@ async def get_advice_voice(
 
     # Steps 2-4 — same as text endpoint
     english_input = translate_to_english(transcribed, lang)
-    english_advice, confidence = get_advice_english(english_input)
+    english_advice, confidence = get_advice_english(english_input, lang=lang)
     translated_advice = translate_from_english(english_advice, lang)
+    if lang != "en" and (not translated_advice.strip() or translated_advice.strip() == english_advice.strip()):
+        translated_advice = f"{english_advice}"
+
+    if lang != "en":
+        translated_advice = f"{translated_advice}\n\n(English version: {english_advice})"
 
     audio_b64 = None
     if tts:
@@ -560,7 +609,12 @@ async def agricultural_advice_compat(req: FrontendRequest):
         lang = "en"
 
     english_input             = translate_to_english(req.query, lang)
-    english_advice, confidence = get_advice_english(english_input)
+    english_advice, confidence = get_advice_english(english_input, lang=lang)
     translated_advice         = translate_from_english(english_advice, lang)
+    if lang != "en" and (not translated_advice.strip() or translated_advice.strip() == english_advice.strip()):
+        translated_advice = f"{english_advice}"
 
-    return JSONResponse(content={"response": translated_advice})
+    if lang != "en":
+        translated_advice = f"{translated_advice}\n\n(English version: {english_advice})"
+
+    return JSONResponse(content={"response": translated_advice, "confidence": confidence, "language": lang})
