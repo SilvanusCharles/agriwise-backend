@@ -15,10 +15,13 @@ Deploy to Render:
 
 import io
 import os
+import time
+import json
 import base64
 import tempfile
 import numpy as np
 import torch
+import requests
 from pathlib import Path
 from functools import lru_cache
 
@@ -32,12 +35,20 @@ from deep_translator import GoogleTranslator
 from gtts import gTTS
 import whisper
 
+try:
+    from langdetect import detect, DetectorFactory
+    DetectorFactory.seed = 0
+except ImportError:
+    # dev environment may not have langdetect installed; fallback to English detection
+    print("WARNING: langdetect not installed, defaulting language detection to English")
+    def detect(text):
+        return "en"
 
-from langdetect import detect, DetectorFactory
-from deep_translator import GoogleTranslator
-from langdetect import detect
-# Ensures detection is consistent
-DetectorFactory.seed = 0
+try:
+    import faiss
+except ImportError:
+    faiss = None
+    print("WARNING: faiss not installed, vector search will be disabled")
 
 def smart_translate_to_english(text, user_hint):
     """Detects the language and translates it to English."""
@@ -87,9 +98,12 @@ app.add_middleware(
 
 # ── Config ────────────────────────────────────────────────────────────────────
 # Local path during development. For Render, model is downloaded from HF.
-HF_REPO        = os.getenv("HF_REPO", "your-hf-username/kisan-vaani-agricultural-advisor")
-MODEL_PATH     = os.getenv("MODEL_PATH", "/app/kisan_vaani_model")   # local fallback
-DEVICE         = "cuda" if torch.cuda.is_available() else "cpu"
+HF_REPO             = os.getenv("HF_REPO", "your-hf-username/kisan-vaani-agricultural-advisor")
+MODEL_PATH          = os.getenv("MODEL_PATH", "/app/kisan_vaani_model")   # local fallback
+DEVICE              = "cuda" if torch.cuda.is_available() else "cpu"
+EMBEDDING_MODEL     = os.getenv("EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
+HF_INFERENCE_TOKEN  = os.getenv("HF_INFERENCE_TOKEN", None)
+FAISS_INDEX_PATH    = Path(MODEL_PATH) / "faiss.index"
 
 # ── Supported languages ───────────────────────────────────────────────────────
 SUPPORTED_LANGUAGES = {
@@ -167,6 +181,46 @@ def load_whisper():
     """Load Whisper STT model — 'base' is fast and small enough for Render free tier."""
     print("Loading Whisper STT model …")
     return whisper.load_model("base")
+
+@lru_cache(maxsize=1)
+def load_embedding_model():
+    """Load sentence-transformers embedding model."""
+    try:
+        from sentence_transformers import SentenceTransformer
+    except ImportError as e:
+        raise ImportError("sentence-transformers is required for efficient indexing. pip install sentence-transformers") from e
+
+    print(f"Loading embedding model: {EMBEDDING_MODEL}")
+    return SentenceTransformer(EMBEDDING_MODEL)
+
+@lru_cache(maxsize=1)
+def build_vector_index():
+    """Build FAISS index from knowledge base entries."""
+    kb_entries = load_knowledge_base()
+    if not kb_entries:
+        return None, []
+
+    if faiss is None:
+        print("FAISS not installed; skipping vector index.")
+        return None, kb_entries
+
+    try:
+        embed_model = load_embedding_model()
+    except Exception as e:
+        print(f"Embedding model unavailable: {e}")
+        return None, kb_entries
+
+    embeddings = np.array(embed_model.encode(kb_entries, convert_to_numpy=True, show_progress_bar=False), dtype=np.float32)
+    faiss.normalize_L2(embeddings)
+    index = faiss.IndexFlatIP(embeddings.shape[1])
+    index.add(embeddings)
+
+    try:
+        faiss.write_index(index, str(FAISS_INDEX_PATH))
+    except Exception as e:
+        print(f"Failed to save FAISS index: {e}")
+
+    return index, kb_entries
 
 @lru_cache(maxsize=1)
 @lru_cache(maxsize=1)
@@ -262,52 +316,108 @@ def text_to_speech_base64(text: str, lang: str) -> str:
         return ""
 
 # ── Core advice retrieval ─────────────────────────────────────────────────────
+def hf_model_fallback(problem: str) -> str:
+    if not HF_INFERENCE_TOKEN:
+        return ""
+
+    url = f"https://api-inference.huggingface.co/models/{HF_REPO}"
+    headers = {
+        "Authorization": f"Bearer {HF_INFERENCE_TOKEN}",
+        "Content-Type": "application/json",
+    }
+    prompt = f"You are an agriculture expert. Provide concise farming advice for: {problem}"
+
+    try:
+        response = requests.post(url, headers=headers, json={"inputs": prompt, "options": {"wait_for_model": True}}, timeout=25)
+        response.raise_for_status()
+        data = response.json()
+
+        if isinstance(data, dict) and data.get("error"):
+            print(f"HF fallback returned error: {data['error']}")
+            return ""
+
+        if isinstance(data, list) and len(data) > 0 and isinstance(data[0], dict) and "generated_text" in data[0]:
+            return data[0]["generated_text"]
+
+        if isinstance(data, str):
+            return data
+
+        return ""
+    except Exception as e:
+        print(f"Hugging Face fallback failed: {e}")
+        return ""
+
+
 def get_advice_english(problem: str, batch_size: int = 64):
-    """Score problem against KB, return highest-scoring answer."""
+    start_time = time.time()
     tokenizer, model = load_model()
-    kb               = load_knowledge_base()
-    all_scores       = []
+    vector_index, kb = build_vector_index()
 
-    # Pre-filter: only score entries containing at least one keyword
-    # from the problem — reduces 22k entries to ~300 for speed
-    keywords = [w.lower() for w in problem.split() if len(w) > 4]  # simple heuristic: use words >4 chars as keywords
-    if keywords:
-        filtered_kb = [
-            entry for entry in kb
-            if any(kw in entry.lower() for kw in keywords)
-        ]
-        # Always keep at least 200 entries even if no keyword matches
-        if len(filtered_kb) < 200:
-            filtered_kb = kb[:200]
-    else:
-        filtered_kb = kb[:200]
+    candidates = []
+    if vector_index is not None and faiss is not None:
+        try:
+            embed_model = load_embedding_model()
+            query_emb = np.array(embed_model.encode([problem], convert_to_numpy=True), dtype=np.float32)
+            faiss.normalize_L2(query_emb)
+            D, I = vector_index.search(query_emb, 15)
+            candidates = [kb[idx] for idx in I[0] if idx < len(kb)]
+        except Exception as e:
+            print(f"Vector search fallback error: {e}")
+    elif vector_index is not None and faiss is None:
+        print("FAISS is unavailable at runtime; skipping vector similarity search.")
 
-    # Hard cap at 800 entries max for speed
-    filtered_kb = filtered_kb[:800]
+    if not candidates:
+        keywords = [w.lower() for w in problem.split() if len(w) > 4]
+        if keywords:
+            candidates = [entry for entry in kb if any(kw in entry.lower() for kw in keywords)]
+            if len(candidates) < 200:
+                candidates = kb[:200]
+        else:
+            candidates = kb[:200]
+        candidates = candidates[:800]
 
-    for i in range(0, len(filtered_kb), batch_size):
-        batch = filtered_kb[i : i + batch_size]
-        enc   = tokenizer(
+    if not candidates:
+        candidates = kb[:200]
+
+    all_scores = []
+
+    for i in range(0, len(candidates), batch_size):
+        batch = candidates[i : i + batch_size]
+        enc = tokenizer(
             [problem] * len(batch),
             batch,
-            max_length     = 256,
-            padding        = "max_length",
-            truncation     = True,
-            return_tensors = "pt",
+            max_length=256,
+            padding="max_length",
+            truncation=True,
+            return_tensors="pt",
         ).to(DEVICE)
         with torch.no_grad():
             logits = model(**enc).logits
         scores = torch.softmax(logits, dim=1)[:, 1].cpu().numpy()
         all_scores.extend(scores.tolist())
 
+    if not all_scores:
+        fallback = "I am sorry, I could not process your request right now. Please try again with more details."
+        print(f"get_advice_english (no scores) runtime: {time.time() - start_time:.3f}s")
+        return fallback, 0.0
+
     best_idx = int(np.argmax(all_scores))
     confidence = float(all_scores[best_idx])
+    best_answer = candidates[best_idx]
 
-    # NEW: Safety check to stop random guessing
-    # If confidence is too low, return a helpful fallback instead
-    if confidence < 0.4: 
-        return "I couldn't find an exact match for your query. Please provide more details about the crop, symptoms, or soil conditions so I can give you accurate advice.", confidence
-    return filtered_kb[best_idx], confidence
+    if confidence < 0.4:
+        hf_text = hf_model_fallback(problem)
+        if hf_text:
+            print(f"Low confidence fallback from HF model: {confidence:.2f}")
+            return hf_text, confidence
+
+        fallback_text = "I couldn't find a high-confidence answer. Please add crop type, symptoms, and location condition for a better response."
+        print(f"Low confidence: {confidence:.2f}, return fallback.")
+        return fallback_text, confidence
+
+    elapsed = time.time() - start_time
+    print(f"get_advice_english succeeded in {elapsed:.3f}s, confidence {confidence:.3f}")
+    return best_answer, confidence
 # ── Request / Response models ─────────────────────────────────────────────────
 class AdviceRequest(BaseModel):
     problem : str
@@ -342,6 +452,7 @@ def get_advice(req: AdviceRequest):
     Returns:
         AdviceResponse with translated advice and optional audio.
     """
+    start_time = time.time()
     lang = req.lang.lower().strip()
     if lang not in SUPPORTED_LANGUAGES:
         raise HTTPException(
@@ -349,16 +460,10 @@ def get_advice(req: AdviceRequest):
             detail=f"Unsupported language '{lang}'. Choose from: {list(SUPPORTED_LANGUAGES.keys())}"
         )
 
-    # Step 1 — translate input to English
     english_input = translate_to_english(req.problem, lang)
-
-    # Step 2 — retrieve best matching advice
     english_advice, confidence = get_advice_english(english_input)
-
-    # Step 3 — translate advice back to input language
     translated_advice = translate_from_english(english_advice, lang)
 
-    # Step 4 — optionally generate TTS audio
     audio_b64 = None
     if req.tts:
         try:
@@ -366,14 +471,17 @@ def get_advice(req: AdviceRequest):
         except Exception as e:
             print(f"TTS warning: {e}")
 
+    elapsed = time.time() - start_time
+    print(f"/advice request in {elapsed:.3f}s (lang={lang}, confidence={confidence:.3f})")
+
     return AdviceResponse(
-        input_text        = req.problem,
-        english_input     = english_input,
-        english_advice    = english_advice,
-        translated_advice = translated_advice,
-        confidence        = confidence,
-        lang              = lang,
-        audio_base64      = audio_b64,
+        input_text=req.problem,
+        english_input=english_input,
+        english_advice=english_advice,
+        translated_advice=translated_advice,
+        confidence=confidence,
+        lang=lang,
+        audio_base64=audio_b64,
     )
 
 @app.post("/advice/voice", response_model=AdviceResponse)
@@ -393,6 +501,7 @@ async def get_advice_voice(
     Returns:
         Same AdviceResponse as /advice, with transcribed text filled in.
     """
+    start_time = time.time()
     lang = lang.lower().strip()
     if lang not in SUPPORTED_LANGUAGES:
         raise HTTPException(status_code=422, detail=f"Unsupported language '{lang}'.")
@@ -413,7 +522,7 @@ async def get_advice_voice(
         os.unlink(tmp_path)   # always clean up temp file
 
     # Steps 2-4 — same as text endpoint
-    english_input     = translate_to_english(transcribed, lang)
+    english_input = translate_to_english(transcribed, lang)
     english_advice, confidence = get_advice_english(english_input)
     translated_advice = translate_from_english(english_advice, lang)
 
@@ -423,6 +532,9 @@ async def get_advice_voice(
             audio_b64 = text_to_speech_base64(translated_advice, lang)
         except Exception as e:
             print(f"TTS warning: {e}")
+
+    elapsed = time.time() - start_time
+    print(f"/advice/voice request in {elapsed:.3f}s (lang={lang}, confidence={confidence:.3f})")
 
     return AdviceResponse(
         input_text        = transcribed,
