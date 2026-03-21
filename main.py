@@ -96,6 +96,37 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ── Startup event: eager load models to avoid per-request delays ──────────────
+@app.on_event("startup")
+async def startup_event():
+    """Load heavy models at startup, not on first request."""
+    print("\n[STARTUP] Loading models...")
+    try:
+        load_model()
+        print("[STARTUP] Model loaded.")
+    except Exception as e:
+        print(f"[STARTUP] Model load failed: {e}")
+    
+    try:
+        load_whisper()
+        print("[STARTUP] Whisper loaded.")
+    except Exception as e:
+        print(f"[STARTUP] Whisper load failed: {e}")
+    
+    try:
+        load_embedding_model()
+        print("[STARTUP] Embedding model loaded.")
+    except Exception as e:
+        print(f"[STARTUP] Embedding model load failed: {e}")
+    
+    try:
+        build_vector_index()
+        print("[STARTUP] Vector index ready.")
+    except Exception as e:
+        print(f"[STARTUP] Vector index build failed: {e}")
+    
+    print("[STARTUP] Initialization complete.\n")
+
 # ── Config ────────────────────────────────────────────────────────────────────
 # Local path during development. For Render, model is downloaded from HF.
 HF_REPO             = os.getenv("HF_REPO", "your-hf-username/kisan-vaani-agricultural-advisor")
@@ -197,7 +228,7 @@ def load_embedding_model():
 
 @lru_cache(maxsize=1)
 def build_vector_index():
-    """Build FAISS index from knowledge base entries."""
+    """Build FAISS index from knowledge base entries. Uses cached disk version if available."""
     kb_entries = load_knowledge_base()
     if not kb_entries:
         return None, []
@@ -206,25 +237,37 @@ def build_vector_index():
         print("FAISS not installed; skipping vector index.")
         return None, kb_entries
 
+    # Try loading existing index from disk first (massive speedup)
+    if FAISS_INDEX_PATH.exists():
+        try:
+            index = faiss.read_index(str(FAISS_INDEX_PATH))
+            print(f"Loaded cached FAISS index from disk ({FAISS_INDEX_PATH})")
+            return index, kb_entries
+        except Exception as e:
+            print(f"Failed to load cached FAISS index: {e}")
+
+    # Build new index only if not cached
     try:
         embed_model = load_embedding_model()
     except Exception as e:
         print(f"Embedding model unavailable: {e}")
         return None, kb_entries
 
+    print("Building FAISS index (first run)...")
     embeddings = np.array(embed_model.encode(kb_entries, convert_to_numpy=True, show_progress_bar=False), dtype=np.float32)
     faiss.normalize_L2(embeddings)
     index = faiss.IndexFlatIP(embeddings.shape[1])
     index.add(embeddings)
 
     try:
+        FAISS_INDEX_PATH.parent.mkdir(parents=True, exist_ok=True)
         faiss.write_index(index, str(FAISS_INDEX_PATH))
+        print(f"Saved FAISS index to disk ({FAISS_INDEX_PATH})")
     except Exception as e:
         print(f"Failed to save FAISS index: {e}")
 
     return index, kb_entries
 
-@lru_cache(maxsize=1)
 @lru_cache(maxsize=1)
 def load_knowledge_base():
     """
@@ -334,6 +377,22 @@ def sanitize_advice_text(answer: str) -> str:
 
     return answer.strip()
 
+
+# ── Response cache for frequent queries ───────────────────────────────────────
+_response_cache: dict = {}
+
+def get_cached_response(query_hash: str, lang: str) -> tuple[str, float] | None:
+    """Retrieve cached response if available."""
+    key = f"{query_hash}:{lang}"
+    return _response_cache.get(key, None)
+
+def cache_response(query_hash: str, lang: str, response: str, confidence: float):
+    """Cache a response for future requests."""
+    key = f"{query_hash}:{lang}"
+    if len(_response_cache) > 500:  # Limit cache size
+        _response_cache.clear()
+    _response_cache[key] = (response, confidence)
+
 # ── Core advice retrieval ─────────────────────────────────────────────────────
 def hf_model_fallback(problem: str, lang: str = "en") -> str:
     if not HF_INFERENCE_TOKEN or not USE_HF_FALLBACK:
@@ -387,6 +446,15 @@ def hf_model_fallback(problem: str, lang: str = "en") -> str:
 
 def get_advice_english(problem: str, lang: str = "en", batch_size: int = 64):
     start_time = time.time()
+    
+    # Check cache first (super fast for common queries)
+    query_hash = hash(problem.lower())
+    cached = get_cached_response(query_hash, lang)
+    if cached is not None:
+        response, confidence = cached
+        print(f"Cache hit for '{problem[:50]}...' in {(time.time() - start_time):.3f}s")
+        return response, confidence
+    
     tokenizer, model = load_model()
     vector_index, kb = build_vector_index()
 
@@ -396,7 +464,7 @@ def get_advice_english(problem: str, lang: str = "en", batch_size: int = 64):
             embed_model = load_embedding_model()
             query_emb = np.array(embed_model.encode([problem], convert_to_numpy=True), dtype=np.float32)
             faiss.normalize_L2(query_emb)
-            D, I = vector_index.search(query_emb, 15)
+            D, I = vector_index.search(query_emb, 50)  # Reduced from 15 for better coverage
             candidates = [kb[idx] for idx in I[0] if idx < len(kb)]
         except Exception as e:
             print(f"Vector search fallback error: {e}")
@@ -407,14 +475,12 @@ def get_advice_english(problem: str, lang: str = "en", batch_size: int = 64):
         keywords = [w.lower() for w in problem.split() if len(w) > 4]
         if keywords:
             candidates = [entry for entry in kb if any(kw in entry.lower() for kw in keywords)]
-            if len(candidates) < 200:
-                candidates = kb[:200]
-        else:
-            candidates = kb[:200]
-        candidates = candidates[:800]
+        if len(candidates) < 50:
+            candidates = kb[:50]  # Reduced from 200
+        candidates = candidates[:64]  # Reduced from 800 — exactly one batch!
 
     if not candidates:
-        candidates = kb[:200]
+        candidates = kb[:50]  # Reduced from 200
 
     all_scores = []
 
@@ -451,6 +517,10 @@ def get_advice_english(problem: str, lang: str = "en", batch_size: int = 64):
     print(f"get_advice_english succeeded in {elapsed:.3f}s, confidence {confidence:.3f}")
 
     best_answer = sanitize_advice_text(best_answer) or "I am sorry, I could not process your request right now. Please try again with more details."
+    
+    # Cache the response for future requests
+    cache_response(query_hash, lang, best_answer, confidence)
+    
     return best_answer, confidence
 # ── Request / Response models ─────────────────────────────────────────────────
 class AdviceRequest(BaseModel):
